@@ -1129,34 +1129,7 @@ JS_CODE
 
 
 # ── SERVER ────────────────────────────────────────────────────────────────────
-import socket, threading, http.server as _hs
-
-_server_store = {}
-
-def start_viewer_server(html_content):
-    global _server_store
-    if _server_store.get('html') == html_content and _server_store.get('port'):
-        return _server_store['port']
-    old = _server_store.get('server')
-    if old:
-        try: old.shutdown()
-        except: pass
-    with socket.socket() as s:
-        s.bind(('', 0)); port = s.getsockname()[1]
-    content_bytes = html_content.encode('utf-8')
-    class Handler(_hs.BaseHTTPRequestHandler):
-        def do_GET(self):
-            self.send_response(200)
-            self.send_header('Content-Type','text/html; charset=utf-8')
-            self.send_header('Content-Length', str(len(content_bytes)))
-            self.send_header('Access-Control-Allow-Origin','*')
-            self.end_headers()
-            self.wfile.write(content_bytes)
-        def log_message(self, *a): pass
-    server = _hs.HTTPServer(('localhost', port), Handler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    _server_store = {'server': server, 'port': port, 'html': html_content}
-    return port
+# Server removed - using st.components.v1.html instead
 
 
 # ── SESSION STATE ─────────────────────────────────────────────────────────────
@@ -1379,13 +1352,9 @@ else:
                 break
 
     html = build_viewer_html(stl_b64, geo, features, filename)
-    port = start_viewer_server(html)
-
-    st.markdown(f'''
-    <iframe src="http://localhost:{port}" width="100%" height="700"
-      frameborder="0" style="border-radius:8px;border:1px solid #0f3460;"
-      allow="clipboard-write"></iframe>
-    ''', unsafe_allow_html=True)
+    # Use st.components.v1.html - works on Streamlit Cloud (no localhost needed)
+    import streamlit.components.v1 as components
+    components.html(html, height=700, scrolling=False)
 
     c1,c2,c3 = st.columns(3)
     with c1:
