@@ -14,6 +14,19 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+class _NumpyEncoder(json.JSONEncoder):
+    """Handle numpy types in JSON serialization."""
+    def default(self, obj):
+        import numpy as np
+        if isinstance(obj, (np.integer,)):   return int(obj)
+        if isinstance(obj, (np.floating,)):  return float(obj)
+        if isinstance(obj, (np.ndarray,)):   return obj.tolist()
+        if isinstance(obj, (np.bool_,)):     return bool(obj)
+        return super().default(obj)
+
+def safe_json(obj):
+    return json.dumps(obj, indent=2, cls=_NumpyEncoder)
+
 # ── TEMP STORAGE (last 10 files) ─────────────────────────────────────────────
 STORAGE_DIR = os.path.join(tempfile.gettempdir(), 'cmti_cad_storage')
 os.makedirs(STORAGE_DIR, exist_ok=True)
@@ -1385,5 +1398,5 @@ else:
                                "application/sla", use_container_width=True)
     with c3:
         if geo:
-            st.download_button("⬇️ JSON", json.dumps(geo,indent=2),
+            st.download_button("⬇️ JSON", safe_json(geo),
                                "geometry.json","application/json", use_container_width=True)
