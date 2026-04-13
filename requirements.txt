@@ -1,0 +1,5 @@
+streamlit>=1.28.0
+trimesh>=3.23.0
+numpy>=1.24.0,<2.0.0
+scipy
+pillow
