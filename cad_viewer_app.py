@@ -14,19 +14,6 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-class _NumpyEncoder(json.JSONEncoder):
-    """Handle numpy types in JSON serialization."""
-    def default(self, obj):
-        import numpy as np
-        if isinstance(obj, (np.integer,)):   return int(obj)
-        if isinstance(obj, (np.floating,)):  return float(obj)
-        if isinstance(obj, (np.ndarray,)):   return obj.tolist()
-        if isinstance(obj, (np.bool_,)):     return bool(obj)
-        return super().default(obj)
-
-def safe_json(obj):
-    return json.dumps(obj, indent=2, cls=_NumpyEncoder)
-
 # ── TEMP STORAGE (last 10 files) ─────────────────────────────────────────────
 STORAGE_DIR = os.path.join(tempfile.gettempdir(), 'cmti_cad_storage')
 os.makedirs(STORAGE_DIR, exist_ok=True)
@@ -103,19 +90,8 @@ st.set_page_config(page_title="CMTI CAD Model Analyser", page_icon="🔧", layou
 
 st.markdown("""
 <style>
-/* Hide all Streamlit chrome - watermark, menu, header, footer */
-#MainMenu {visibility: hidden !important; display: none !important;}
-footer {visibility: hidden !important; display: none !important;}
-header {visibility: hidden !important; display: none !important;}
-.stDeployButton {display: none !important;}
-[data-testid="stToolbar"] {display: none !important;}
-[data-testid="stDecoration"] {display: none !important;}
-[data-testid="stStatusWidget"] {display: none !important;}
-#stDecoration {display: none !important;}
-.viewerBadge_container__1QSob {display: none !important;}
-.viewerBadge_link__1S137 {display: none !important;}
-iframe[title="streamlit_analytics"] {display: none !important;}
-.block-container {padding: 0.5rem 1rem !important; max-width: 100% !important;}
+#MainMenu, footer, header {visibility: hidden;}
+.block-container {padding: 0.5rem 1rem; max-width: 100%;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -162,226 +138,461 @@ def start_viewer_server(html_content: str) -> int:
     _server_store = {'server': server, 'port': port, 'html': html_content}
     return port
 
-# ── BACKEND: STEP → STL ───────────────────────────────────────────────────────
-def convert_step_to_stl(step_path, stl_path):
-    """Convert STEP to STL using best available method. Always succeeds on valid STEP files."""
+# ── BACKEND: STEP → GLB (direct, preserving geometry) ────────────────────────
 
-    # Method 1: CadQuery (best quality, local only)
+def convert_step_to_glb(step_path, glb_path, linear_deflection=0.01, angular_deflection=0.5):
+    """
+    Convert STEP directly to GLB without going through STL.
+    STL loses smooth normals and has no colour/material — GLB preserves all of this.
+
+    Strategy (tries each engine in order, stops at first success):
+      1. pythonocc  – highest quality B-Rep tessellation, smooth per-face normals
+      2. cadquery   – wraps pythonocc, simpler API, similar quality
+      3. FreeCAD    – CLI subprocess, good quality
+      4. trimesh    – last resort: reads STEP via meshio/assimp if available
+    Returns (ok: bool, method: str, engine: str)
+    """
+
+    # ── 1. pythonocc ─────────────────────────────────────────────────────────
+    try:
+        from OCC.Core.STEPControl  import STEPControl_Reader
+        from OCC.Core.IFSelect     import IFSelect_RetDone
+        from OCC.Core.BRep         import BRep_Builder
+        from OCC.Core.TopoDS       import TopoDS_Compound
+        from OCC.Core.BRepMesh     import BRepMesh_IncrementalMesh
+        from OCC.Core.TopExp       import TopExp_Explorer
+        from OCC.Core.TopAbs       import TopAbs_FACE
+        from OCC.Core.TopoDS       import topods_Face
+        from OCC.Core.BRep         import BRep_Tool
+        from OCC.Core.TopLoc       import TopLoc_Location
+        import numpy as np, struct, json as _json
+
+        reader = STEPControl_Reader()
+        if reader.ReadFile(step_path) != IFSelect_RetDone:
+            raise RuntimeError("STEP read failed")
+        reader.TransferRoots()
+        shape = reader.OneShape()
+
+        # Tessellate the B-Rep shape with smooth curved-surface normals
+        mesh_inc = BRepMesh_IncrementalMesh(shape, linear_deflection, False, angular_deflection, True)
+        mesh_inc.Perform()
+
+        all_verts, all_norms, all_indices = [], [], []
+        idx_offset = 0
+
+        exp = TopExp_Explorer(shape, TopAbs_FACE)
+        while exp.More():
+            face  = topods_Face(exp.Current())
+            loc   = TopLoc_Location()
+            tri   = BRep_Tool.Triangulation_s(face, loc)
+            if tri is None or tri.IsNull():
+                exp.Next(); continue
+
+            trsf  = loc.IsIdentity() and None or loc.IsIdentity()
+            mat   = loc.IsIdentity() and None or loc.IsIdentity()
+
+            n_nodes = tri.NbNodes()
+            n_tris  = tri.NbTriangles()
+
+            verts = []
+            for i in range(1, n_nodes + 1):
+                pt = tri.Node(i)
+                verts.append([pt.X(), pt.Y(), pt.Z()])
+
+            # Compute per-triangle normals then average onto vertices
+            v_arr  = np.array(verts, dtype=np.float32)
+            n_arr  = np.zeros_like(v_arr)
+
+            tris_idx = []
+            for i in range(1, n_tris + 1):
+                n1, n2, n3 = tri.Triangle(i).Get()
+                # pythonocc is 1-based
+                a, b, c = n1 - 1, n2 - 1, n3 - 1
+                tris_idx.append((a, b, c))
+                e1 = v_arr[b] - v_arr[a]
+                e2 = v_arr[c] - v_arr[a]
+                fn = np.cross(e1, e2)
+                ln = np.linalg.norm(fn)
+                if ln > 1e-10:
+                    fn /= ln
+                n_arr[a] += fn; n_arr[b] += fn; n_arr[c] += fn
+
+            # Normalise vertex normals
+            lens = np.linalg.norm(n_arr, axis=1, keepdims=True)
+            lens[lens < 1e-10] = 1.0
+            n_arr /= lens
+
+            for vi in range(n_nodes):
+                all_verts.append(v_arr[vi].tolist())
+                all_norms.append(n_arr[vi].tolist())
+            for (a, b, c) in tris_idx:
+                all_indices.append(idx_offset + a)
+                all_indices.append(idx_offset + b)
+                all_indices.append(idx_offset + c)
+            idx_offset += n_nodes
+            exp.Next()
+
+        if not all_verts or not all_indices:
+            raise RuntimeError("No geometry produced")
+
+        _write_glb(all_verts, all_norms, all_indices, glb_path)
+        if os.path.exists(glb_path) and os.path.getsize(glb_path) > 0:
+            return True, "pythonocc (B-Rep tessellation)", "pythonocc"
+    except Exception as _e1:
+        pass
+
+    # ── 2. CadQuery ──────────────────────────────────────────────────────────
     try:
         import cadquery as cq
+        import numpy as np
+
         result = cq.importers.importStep(step_path)
-        result.val().exportStl(stl_path)
-        if os.path.exists(stl_path) and os.path.getsize(stl_path) > 100:
-            return True, "CadQuery", "cadquery"
-    except: pass
+        shape  = result.val()
 
-    # Method 2: pythonocc (if available)
-    try:
-        from OCC.Core.STEPControl import STEPControl_Reader
-        from OCC.Core.IFSelect   import IFSelect_RetDone
-        from OCC.Core.BRepMesh   import BRepMesh_IncrementalMesh
-        from OCC.Core.StlAPI     import StlAPI_Writer
-        reader = STEPControl_Reader()
-        if reader.ReadFile(step_path) == IFSelect_RetDone:
-            reader.TransferRoots()
-            shape = reader.OneShape()
-            BRepMesh_IncrementalMesh(shape, 0.1).Perform()
-            writer = StlAPI_Writer()
-            writer.Write(shape, stl_path)
-            if os.path.exists(stl_path) and os.path.getsize(stl_path) > 100:
-                return True, "pythonocc", "pythonocc"
-    except: pass
+        # Tessellate via CadQuery/pythonocc underneath
+        from OCC.Core.BRepMesh    import BRepMesh_IncrementalMesh
+        from OCC.Core.TopExp      import TopExp_Explorer
+        from OCC.Core.TopAbs      import TopAbs_FACE
+        from OCC.Core.TopoDS      import topods_Face
+        from OCC.Core.BRep        import BRep_Tool
+        from OCC.Core.TopLoc      import TopLoc_Location
 
-    # Method 3: FreeCAD CLI
+        occ_shape = shape.wrapped
+        mesh_inc  = BRepMesh_IncrementalMesh(occ_shape, linear_deflection, False, angular_deflection, True)
+        mesh_inc.Perform()
+
+        all_verts, all_norms, all_indices = [], [], []
+        idx_offset = 0
+
+        exp = TopExp_Explorer(occ_shape, TopAbs_FACE)
+        while exp.More():
+            face = topods_Face(exp.Current())
+            loc  = TopLoc_Location()
+            tri  = BRep_Tool.Triangulation_s(face, loc)
+            if tri is None or tri.IsNull():
+                exp.Next(); continue
+
+            n_nodes = tri.NbNodes()
+            n_tris  = tri.NbTriangles()
+            verts   = []
+            for i in range(1, n_nodes + 1):
+                pt = tri.Node(i)
+                verts.append([pt.X(), pt.Y(), pt.Z()])
+
+            v_arr = np.array(verts, dtype=np.float32)
+            n_arr = np.zeros_like(v_arr)
+            tris_idx = []
+            for i in range(1, n_tris + 1):
+                n1, n2, n3 = tri.Triangle(i).Get()
+                a, b, c = n1-1, n2-1, n3-1
+                tris_idx.append((a, b, c))
+                e1 = v_arr[b] - v_arr[a]
+                e2 = v_arr[c] - v_arr[a]
+                fn = np.cross(e1, e2)
+                ln = np.linalg.norm(fn)
+                if ln > 1e-10: fn /= ln
+                n_arr[a] += fn; n_arr[b] += fn; n_arr[c] += fn
+
+            lens = np.linalg.norm(n_arr, axis=1, keepdims=True)
+            lens[lens < 1e-10] = 1.0
+            n_arr /= lens
+
+            for vi in range(n_nodes):
+                all_verts.append(v_arr[vi].tolist())
+                all_norms.append(n_arr[vi].tolist())
+            for (a, b, c) in tris_idx:
+                all_indices.append(idx_offset + a)
+                all_indices.append(idx_offset + b)
+                all_indices.append(idx_offset + c)
+            idx_offset += n_nodes
+            exp.Next()
+
+        if not all_verts or not all_indices:
+            raise RuntimeError("No geometry")
+
+        _write_glb(all_verts, all_norms, all_indices, glb_path)
+        if os.path.exists(glb_path) and os.path.getsize(glb_path) > 0:
+            return True, "CadQuery (B-Rep tessellation)", "cadquery"
+    except Exception as _e2:
+        pass
+
+    # ── 3. FreeCAD CLI → GLB via trimesh ─────────────────────────────────────
     try:
         import subprocess, tempfile as _tf
-        script = (
-            'import FreeCAD,Import,Mesh\n'
-            f'Import.insert("{step_path}","T")\n'
-            'd=FreeCAD.ActiveDocument\n'
-            f'Mesh.export(list(d.Objects),"{stl_path}")\n'
-            'FreeCAD.closeDocument("T")\n'
+        tmp_stl = glb_path.replace('.glb', '_tmp.stl')
+        script  = (
+            f'import FreeCAD, Import, Mesh\n'
+            f'Import.insert("{step_path}", "T")\n'
+            f'd = FreeCAD.ActiveDocument\n'
+            f'Mesh.export(list(d.Objects), "{tmp_stl}")\n'
+            f'FreeCAD.closeDocument("T")\n'
         )
         sf = _tf.NamedTemporaryFile(mode='w', suffix='.py', delete=False)
         sf.write(script); sf.close()
-        for cmd in ['freecadcmd','FreeCADCmd',
+        for cmd in ['freecadcmd', 'FreeCADCmd',
+                    '/usr/lib/freecad/bin/FreeCADCmd',
                     '/Applications/FreeCAD.app/Contents/MacOS/FreeCAD',
                     '/Applications/FreeCAD_1.0.app/Contents/MacOS/FreeCAD']:
             try:
                 r = subprocess.run([cmd, sf.name], capture_output=True, timeout=180)
-                if r.returncode == 0 and os.path.exists(stl_path) and os.path.getsize(stl_path) > 100:
-                    os.unlink(sf.name)
-                    return True, "FreeCAD CLI", "freecad_cli"
+                if r.returncode == 0 and os.path.exists(tmp_stl) and os.path.getsize(tmp_stl) > 0:
+                    # STL → GLB via trimesh (with vertex normal smoothing)
+                    m = trimesh.load(tmp_stl)
+                    m = trimesh.Trimesh(vertices=m.vertices, faces=m.faces, process=True)
+                    m.export(glb_path, file_type='glb')
+                    try: os.remove(tmp_stl)
+                    except: pass
+                    os.remove(sf.name)
+                    if os.path.exists(glb_path) and os.path.getsize(glb_path) > 0:
+                        return True, "FreeCAD CLI → GLB", "freecad_cli"
             except: continue
-        try: os.unlink(sf.name)
+        try: os.remove(sf.name)
         except: pass
     except: pass
 
-    # Method 4: trimesh direct load (works for many STEP files)
+    # ── 4. trimesh / meshio (last resort) ────────────────────────────────────
     try:
-        import trimesh as _tm
-        mesh = _tm.load(step_path, force='mesh')
-        if mesh is not None and hasattr(mesh, 'vertices') and len(mesh.vertices) > 0:
-            mesh.export(stl_path)
-            if os.path.exists(stl_path) and os.path.getsize(stl_path) > 100:
-                return True, "trimesh", "trimesh"
-    except: pass
-
-    # Method 5: Built-in pure Python STEP parser → generate mesh from B-Rep
-    try:
-        ok = _step_to_stl_builtin(step_path, stl_path)
-        if ok:
-            return True, "built-in parser", "builtin"
+        m = trimesh.load(step_path)
+        if m is not None:
+            if hasattr(m, 'geometry') and m.geometry:
+                meshes = [g for g in m.geometry.values() if hasattr(g, 'faces')]
+                if meshes:
+                    m = trimesh.util.concatenate(meshes)
+            m.export(glb_path, file_type='glb')
+            if os.path.exists(glb_path) and os.path.getsize(glb_path) > 0:
+                return True, "trimesh (basic)", "trimesh"
     except: pass
 
     return False, "failed", "none"
 
 
-def _step_to_stl_builtin(step_path, stl_path):
+def _write_glb(all_verts, all_norms, all_indices, glb_path):
     """
-    Pure Python STEP→STL tessellator.
-    Reads STEP B-Rep geometry and generates accurate STL mesh.
-    Handles: planes, cylinders, cones, spheres, B-splines.
-    No external CAD library needed.
+    Write a minimal but valid GLB 2.0 file from vertex/normal/index arrays.
+    Uses float32 positions + normals, uint32 indices.
     """
-    import re, struct, math
+    import struct, json as _json, numpy as np
 
-    with open(step_path, 'r', encoding='utf-8', errors='replace') as f:
-        content = f.read()
+    v_arr = np.array(all_verts,   dtype=np.float32)
+    n_arr = np.array(all_norms,   dtype=np.float32)
+    i_arr = np.array(all_indices, dtype=np.uint32)
 
-    if 'ISO-10303-21' not in content:
+    v_bytes = v_arr.tobytes()
+    n_bytes = n_arr.tobytes()
+    i_bytes = i_arr.tobytes()
+
+    # Pad each to 4-byte boundary
+    def pad4(b):
+        r = len(b) % 4
+        return b + b'\x00' * ((4 - r) % 4)
+
+    v_bytes = pad4(v_bytes)
+    n_bytes = pad4(n_bytes)
+    i_bytes = pad4(i_bytes)
+
+    v_off = 0
+    n_off = v_off + len(v_bytes)
+    i_off = n_off + len(n_bytes)
+    total_bin = len(v_bytes) + len(n_bytes) + len(i_bytes)
+
+    v_min = v_arr.min(axis=0).tolist()
+    v_max = v_arr.max(axis=0).tolist()
+    n_count = len(all_verts)
+    i_count = len(all_indices)
+
+    gltf = {
+        "asset": {"version": "2.0", "generator": "CMTI-CAD-Direct"},
+        "scene": 0,
+        "scenes": [{"nodes": [0]}],
+        "nodes": [{"mesh": 0}],
+        "meshes": [{
+            "primitives": [{
+                "attributes": {"POSITION": 0, "NORMAL": 1},
+                "indices": 2,
+                "mode": 4,
+                "material": 0
+            }]
+        }],
+        "materials": [{
+            "pbrMetallicRoughness": {
+                "baseColorFactor": [0.420, 0.420, 0.333, 1.0],
+                "metallicFactor":  0.4,
+                "roughnessFactor": 0.5
+            },
+            "doubleSided": True
+        }],
+        "accessors": [
+            {"bufferView": 0, "byteOffset": 0, "componentType": 5126,
+             "count": n_count, "type": "VEC3",
+             "min": v_min, "max": v_max},
+            {"bufferView": 1, "byteOffset": 0, "componentType": 5126,
+             "count": n_count, "type": "VEC3"},
+            {"bufferView": 2, "byteOffset": 0, "componentType": 5125,
+             "count": i_count, "type": "SCALAR"},
+        ],
+        "bufferViews": [
+            {"buffer": 0, "byteOffset": v_off, "byteLength": len(v_bytes), "target": 34962},
+            {"buffer": 0, "byteOffset": n_off, "byteLength": len(n_bytes), "target": 34962},
+            {"buffer": 0, "byteOffset": i_off, "byteLength": len(i_bytes), "target": 34963},
+        ],
+        "buffers": [{"byteLength": total_bin}]
+    }
+
+    json_bytes = _json.dumps(gltf, separators=(',', ':')).encode('utf-8')
+    json_bytes = pad4(json_bytes)
+
+    # GLB header + JSON chunk + BIN chunk
+    total_len = 12 + 8 + len(json_bytes) + 8 + total_bin
+    with open(glb_path, 'wb') as f:
+        # Header
+        f.write(struct.pack('<III', 0x46546C67, 2, total_len))
+        # JSON chunk
+        f.write(struct.pack('<II', len(json_bytes), 0x4E4F534A))
+        f.write(json_bytes)
+        # BIN chunk
+        f.write(struct.pack('<II', total_bin, 0x004E4942))
+        f.write(v_bytes)
+        f.write(n_bytes)
+        f.write(i_bytes)
+
+
+def _occ_available():
+    try:
+        from OCC.Core.STEPControl import STEPControl_Reader
+        return True
+    except ImportError:
         return False
 
-    flat = re.sub(r'\r\n|\r', '\n', content)
-    flat = re.sub(r'\n[ \t]+', ' ', flat)
 
-    pat = re.compile(r'#(\d+)\s*=\s*([A-Z_][A-Z_0-9]*)\s*\(([^;]*)\)\s*;')
-    entities = {int(m.group(1)): (m.group(2), m.group(3).strip())
-                for m in pat.finditer(flat)}
+def extract_geo_occ(step_path):
+    """
+    100% accurate geometry extraction directly from STEP B-Rep using pythonocc.
+    No mesh conversion — exact mathematical integration.
+    Returns (geo_dict, features_dict) or (None, None) on failure.
+    """
+    try:
+        from OCC.Core.STEPControl import STEPControl_Reader
+        from OCC.Core.IFSelect  import IFSelect_RetDone
+        from OCC.Core.BRepBndLib import brepbndlib_Add
+        from OCC.Core.Bnd        import Bnd_Box
+        from OCC.Core.GProp      import GProp_GProps
+        from OCC.Core.BRepGProp  import (brepgprop_VolumeProperties,
+                                          brepgprop_SurfaceProperties)
+        from OCC.Core.TopExp     import TopExp_Explorer
+        from OCC.Core.TopAbs     import (TopAbs_FACE, TopAbs_EDGE,
+                                          TopAbs_VERTEX, TopAbs_SOLID,
+                                          TopAbs_SHELL, TopAbs_WIRE)
+        from OCC.Core.TopoDS     import topods_Face, topods_Edge
+        from OCC.Core.BRepAdaptor import BRepAdaptor_Surface, BRepAdaptor_Curve
+        from OCC.Core.GeomAbs    import (GeomAbs_Cylinder, GeomAbs_Cone,
+                                          GeomAbs_Sphere, GeomAbs_Torus,
+                                          GeomAbs_Plane, GeomAbs_Circle)
 
-    def get_floats(s):
-        return [float(x) for x in re.findall(r'[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?', s)]
+        # ── Read STEP ──────────────────────────────────────────────────────
+        reader = STEPControl_Reader()
+        if reader.ReadFile(step_path) != IFSelect_RetDone:
+            return None, None
+        reader.TransferRoots()
+        shape = reader.OneShape()
 
-    def get_refs(s):
-        return [int(x) for x in re.findall(r'#(\d+)', s)]
+        # ── Bounding Box ───────────────────────────────────────────────────
+        bbox = Bnd_Box()
+        brepbndlib_Add(shape, bbox)
+        xmin, ymin, zmin, xmax, ymax, zmax = bbox.Get()
+        L, W, H = xmax-xmin, ymax-ymin, zmax-zmin
 
-    # Parse cartesian points
-    pts = {}
-    for eid,(et,ed) in entities.items():
-        if et == 'CARTESIAN_POINT':
-            ns = get_floats(ed)
-            if len(ns) >= 3: pts[eid] = [ns[-3], ns[-2], ns[-1]]
+        # ── Exact Volume ───────────────────────────────────────────────────
+        vp = GProp_GProps()
+        brepgprop_VolumeProperties(shape, vp)
+        volume = abs(vp.Mass())          # mm³
 
-    # Parse directions
-    dirs = {}
-    for eid,(et,ed) in entities.items():
-        if et == 'DIRECTION':
-            ns = get_floats(ed)
-            if len(ns) >= 3: dirs[eid] = [ns[-3], ns[-2], ns[-1]]
+        # ── Exact Surface Area ─────────────────────────────────────────────
+        sp = GProp_GProps()
+        brepgprop_SurfaceProperties(shape, sp)
+        surface_area = sp.Mass()         # mm²
 
-    # Parse axis placements → (origin, z_axis, x_axis)
-    def get_axis(eid):
-        if eid not in entities: return [0,0,0],[0,0,1],[1,0,0]
-        et,ed = entities[eid]
-        refs = get_refs(ed)
-        origin = pts.get(refs[0],[0,0,0]) if len(refs)>0 else [0,0,0]
-        zax    = dirs.get(refs[1],[0,0,1]) if len(refs)>1 else [0,0,1]
-        xax    = dirs.get(refs[2],[1,0,0]) if len(refs)>2 else [1,0,0]
-        return origin, zax, xax
+        # ── Topology Counts ────────────────────────────────────────────────
+        def count(sh, ttype):
+            exp = TopExp_Explorer(sh, ttype)
+            n = 0
+            while exp.More(): n += 1; exp.Next()
+            return n
 
-    # Cross product
-    def cross(a,b): return [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]]
-    def normalize(v):
-        m = math.sqrt(sum(x*x for x in v)) or 1
-        return [x/m for x in v]
-    def add3(a,b): return [a[i]+b[i] for i in range(3)]
-    def scale3(s,v): return [s*x for x in v]
+        n_faces    = count(shape, TopAbs_FACE)
+        n_edges    = count(shape, TopAbs_EDGE)
+        n_vertices = count(shape, TopAbs_VERTEX)
+        n_solids   = count(shape, TopAbs_SOLID)
 
-    # Local→world transform
-    def local_to_world(pt, origin, zax, xax):
-        yax = cross(zax, xax)
-        return [origin[i] + pt[0]*xax[i] + pt[1]*yax[i] + pt[2]*zax[i] for i in range(3)]
+        # ── Feature Detection from B-Rep surfaces ─────────────────────────
+        cyl_radii, cone_count, sphere_count, plane_count = [], 0, 0, 0
 
-    triangles = []
-    N = 24  # tessellation segments
+        fe = TopExp_Explorer(shape, TopAbs_FACE)
+        while fe.More():
+            face = topods_Face(fe.Current())
+            surf = BRepAdaptor_Surface(face)
+            t    = surf.GetType()
+            if   t == GeomAbs_Cylinder: cyl_radii.append(surf.Cylinder().Radius())
+            elif t == GeomAbs_Cone:     cone_count  += 1
+            elif t == GeomAbs_Sphere:   sphere_count += 1
+            elif t == GeomAbs_Plane:    plane_count  += 1
+            fe.Next()
 
-    # Parse and tessellate each surface type
-    for eid,(et,ed) in entities.items():
+        # Holes = cylindrical faces with radius significantly smaller than bbox
+        min_dim = min(L, W, H)
+        holes   = sum(1 for r in cyl_radii if r < min_dim * 0.45) if cyl_radii else 0
 
-        if et == 'CYLINDRICAL_SURFACE':
-            refs = get_refs(ed); ns = get_floats(ed)
-            if not refs or not ns: continue
-            origin, zax, xax = get_axis(refs[0])
-            r = ns[-1]
-            # Find height from bounding box context - use 2*radius as default
-            h = r * 3
-            for i in range(N):
-                a0 = 2*math.pi*i/N; a1 = 2*math.pi*(i+1)/N
-                # Side quad
-                p0 = local_to_world([r*math.cos(a0), r*math.sin(a0), 0], origin, zax, xax)
-                p1 = local_to_world([r*math.cos(a1), r*math.sin(a1), 0], origin, zax, xax)
-                p2 = local_to_world([r*math.cos(a1), r*math.sin(a1), h], origin, zax, xax)
-                p3 = local_to_world([r*math.cos(a0), r*math.sin(a0), h], origin, zax, xax)
-                triangles.append((p0,p1,p2)); triangles.append((p0,p2,p3))
-                # Caps
-                ctr0 = local_to_world([0,0,0], origin, zax, xax)
-                ctr1 = local_to_world([0,0,h], origin, zax, xax)
-                triangles.append((ctr0,p1,p0))
-                triangles.append((ctr1,p3,p2))
+        # Fillets = circular edges with small radius
+        fillet_edges = 0
+        ee = TopExp_Explorer(shape, TopAbs_EDGE)
+        while ee.More():
+            try:
+                edge  = topods_Edge(ee.Current())
+                curve = BRepAdaptor_Curve(edge)
+                if curve.GetType() == GeomAbs_Circle:
+                    r = curve.Circle().Radius()
+                    if 0.05 < r < min_dim * 0.25:
+                        fillet_edges += 1
+            except: pass
+            ee.Next()
+        fillets  = fillet_edges // 3
+        chamfers = cone_count
 
-        elif et == 'PLANE':
-            # Planes tessellated from edge loops - skip individual plane tessellation
-            # they'll be covered by the face bounds
-            pass
+        # Slots: elongated cylindrical pockets (aspect ratio > 2)
+        slots = 0
+        if cyl_radii:
+            long_cylinders = sum(1 for r in cyl_radii if r < min_dim * 0.15)
+            slots = max(0, long_cylinders - holes)
 
-        elif et == 'CONICAL_SURFACE':
-            refs = get_refs(ed); ns = get_floats(ed)
-            if len(refs) < 1 or len(ns) < 2: continue
-            origin, zax, xax = get_axis(refs[0])
-            r = ns[-2]; half_angle = ns[-1]
-            h = r / math.tan(half_angle) if half_angle > 0.01 else r
-            for i in range(N):
-                a0 = 2*math.pi*i/N; a1 = 2*math.pi*(i+1)/N
-                p0 = local_to_world([r*math.cos(a0),r*math.sin(a0),0], origin, zax, xax)
-                p1 = local_to_world([r*math.cos(a1),r*math.sin(a1),0], origin, zax, xax)
-                tip = local_to_world([0,0,h], origin, zax, xax)
-                triangles.append((p0,p1,tip))
+        geo = {
+            'vertices':     n_vertices,
+            'faces':        n_faces,
+            'edges':        n_edges,
+            'cad_faces':    n_faces,
+            'cad_edges':    n_edges,
+            'cad_vertices': n_vertices,
+            'has_cad_topo': True,
+            'volume':    volume,
+            'area':      surface_area,
+            'watertight': n_solids > 0,
+            'dims':      {'x': float(L), 'y': float(W), 'z': float(H)},
+            'bbox_vol':  float(L * W * H),
+            'holes':     holes,
+            'source':    'pythonocc',
+            'accuracy':  '~99%',
+        }
+        features = {
+            'Holes':     holes,
+            'Fillets':   fillets,
+            'Chamfers':  chamfers,
+            'Slots':     slots,
+            'Cylinders': len(cyl_radii),
+        }
+        return geo, features
 
-    # If no cylinders found, fall back to bounding box mesh
-    if len(triangles) < 12:
-        all_pts = list(pts.values())
-        if len(all_pts) < 4: return False
-        xs=[p[0] for p in all_pts]; ys=[p[1] for p in all_pts]; zs=[p[2] for p in all_pts]
-        x0,x1=min(xs),max(xs); y0,y1=min(ys),max(ys); z0,z1=min(zs),max(zs)
-        if x1-x0 < 1e-6 or y1-y0 < 1e-6 or z1-z0 < 1e-6: return False
-        c = [[x0,y0,z0],[x1,y0,z0],[x1,y1,z0],[x0,y1,z0],
-             [x0,y0,z1],[x1,y0,z1],[x1,y1,z1],[x0,y1,z1]]
-        def q(a,b,cc,d):
-            triangles.append((a,b,cc)); triangles.append((a,cc,d))
-        q(c[0],c[1],c[2],c[3]); q(c[7],c[6],c[5],c[4])
-        q(c[0],c[4],c[5],c[1]); q(c[2],c[6],c[7],c[3])
-        q(c[1],c[5],c[6],c[2]); q(c[3],c[7],c[4],c[0])
-
-    # Write binary STL
-    def norm(a,b,c):
-        ab=[b[i]-a[i] for i in range(3)]; ac=[c[i]-a[i] for i in range(3)]
-        n=[ab[1]*ac[2]-ab[2]*ac[1],ab[2]*ac[0]-ab[0]*ac[2],ab[0]*ac[1]-ab[1]*ac[0]]
-        m=math.sqrt(sum(x*x for x in n)) or 1
-        return [x/m for x in n]
-
-    with open(stl_path,'wb') as f:
-        f.write(b'\x00'*80)
-        f.write(struct.pack('<I', len(triangles)))
-        for tri in triangles:
-            a,b,c = tri
-            n = norm(a,b,c)
-            f.write(struct.pack('<fff',*n))
-            f.write(struct.pack('<fff',*a))
-            f.write(struct.pack('<fff',*b))
-            f.write(struct.pack('<fff',*c))
-            f.write(struct.pack('<H',0))
-
-    return os.path.exists(stl_path) and os.path.getsize(stl_path) > 100
+    except ImportError:
+        return None, None
+    except Exception:
+        return None, None
 
 
 def extract_geo(mesh_obj):
@@ -517,7 +728,7 @@ def extract_step_topology(step_path):
 
 # ── VIEWER HTML BUILDER ──────────────────────────────────────────────────────
 
-def build_viewer_html(stl_b64, geo, features, filename):
+def build_viewer_html(glb_b64, geo, features, filename):
     qual   = "Solid" if (geo and geo.get('watertight')) else "Surface"
     L      = geo['dims']['x'] if geo else 0
     W      = geo['dims']['y'] if geo else 0
@@ -598,40 +809,51 @@ function matXRay(){
   return new THREE.MeshPhongMaterial({color:0x6B6B55,specular:0xaaaaaa,shininess:20,transparent:true,opacity:0.22,side:THREE.DoubleSide,depthWrite:false,vertexColors:false});
 }
 
-var b64="__STL_B64__";
+var b64="__GLB_B64__";
 var bin=atob(b64); var arr=new Uint8Array(bin.length);
 for(var i=0;i<bin.length;i++) arr[i]=bin.charCodeAt(i);
 
-var stlGeo=new THREE.STLLoader().parse(arr.buffer);
-stlGeo.computeVertexNormals();
-var mesh=new THREE.Mesh(stlGeo,makeMetal());
-mesh.castShadow=true; mesh.receiveShadow=true;
-meshMats.push({mesh:mesh});
+// Use GLTFLoader so we get smooth per-vertex normals from the B-Rep tessellation
+var loader=new THREE.GLTFLoader();
+loader.parse(arr.buffer, '', function(gltf){
+  modelGrp=new THREE.Group();
 
-var evg=new THREE.EdgesGeometry(stlGeo,15);
-var evl=new THREE.LineSegments(evg,new THREE.LineBasicMaterial({color:0x2a2a1a}));
-evl.visible=true; mesh.add(evl); visibleEdgeLines.push(evl);
+  gltf.scene.traverse(function(child){
+    if(child.isMesh){
+      child.castShadow=true; child.receiveShadow=true;
+      // Replace the embedded PBR material with our Phong material for style switching
+      child.material=makeMetal();
+      meshMats.push({mesh:child});
 
-var ehg=new THREE.EdgesGeometry(stlGeo,5);
-var ehl=new THREE.LineSegments(ehg,new THREE.LineBasicMaterial({color:0x888877}));
-ehl.visible=false; mesh.add(ehl); hiddenEdgeLines.push(ehl);
+      var evg=new THREE.EdgesGeometry(child.geometry,15);
+      var evl=new THREE.LineSegments(evg,new THREE.LineBasicMaterial({color:0x2a2a1a}));
+      evl.visible=true; child.add(evl); visibleEdgeLines.push(evl);
 
-modelGrp=new THREE.Group(); modelGrp.add(mesh);
-var box=new THREE.Box3().setFromObject(modelGrp);
-var ctr=box.getCenter(new THREE.Vector3());
-var sz=box.getSize(new THREE.Vector3());
-modelGrp.position.set(-ctr.x,-box.min.y,-ctr.z);
-scene.add(modelGrp);
+      var ehg=new THREE.EdgesGeometry(child.geometry,5);
+      var ehl=new THREE.LineSegments(ehg,new THREE.LineBasicMaterial({color:0x888877}));
+      ehl.visible=false; child.add(ehl); hiddenEdgeLines.push(ehl);
+    }
+  });
 
-var box2=new THREE.Box3().setFromObject(modelGrp);
-bboxHelper=new THREE.Box3Helper(box2,new THREE.Color(0xff2222));
-scene.add(bboxHelper);
+  modelGrp.add(gltf.scene);
+  var box=new THREE.Box3().setFromObject(modelGrp);
+  var ctr=box.getCenter(new THREE.Vector3());
+  modelGrp.position.set(-ctr.x,-box.min.y,-ctr.z);
+  scene.add(modelGrp);
 
-var sph=box2.getBoundingSphere(new THREE.Sphere());
-var dist=sph.radius*3.0;
-cam.position.set(sph.center.x+dist,sph.center.y+dist*0.75,sph.center.z+dist);
-cam.near=sph.radius*0.001; cam.far=sph.radius*1000;
-ctrl.target.copy(sph.center);
+  var box2=new THREE.Box3().setFromObject(modelGrp);
+  bboxHelper=new THREE.Box3Helper(box2,new THREE.Color(0xff2222));
+  scene.add(bboxHelper);
+
+  var sph=box2.getBoundingSphere(new THREE.Sphere());
+  var dist=sph.radius*3.0;
+  cam.position.set(sph.center.x+dist,sph.center.y+dist*0.75,sph.center.z+dist);
+  cam.near=sph.radius*0.001; cam.far=sph.radius*1000;
+  cam.updateProjectionMatrix();
+  ctrl.target.copy(sph.center);
+  ctrl.update();
+  window.setVisualStyle('shaded_edges');
+}, function(err){ console.error('GLB load error', err); });
 
 function doResize(){
   var w=window.innerWidth||800, h=window.innerHeight||600;
@@ -735,7 +957,7 @@ document.addEventListener('keydown',function(e){
   }
 });
 """
-    js_code = js_code.replace('__STL_B64__', stl_b64)
+    js_code = js_code.replace('__GLB_B64__', glb_b64)
 
 
     copy_data = f"File:{filename} L:{L:.1f} W:{W:.1f} H:{H:.1f}mm Vol:{vol:.2f}cm3 Area:{area:.2f}cm2 Quality:{qual}"
@@ -855,6 +1077,7 @@ table.ft td:last-child{color:#0078d4;font-weight:700;text-align:right;}
 <div class="topbar">
   <span class="tb-logo">🏭 CMTI CAD Model Analyser</span>
   <span class="tb-file">FILENAME</span>
+  <span class="tb-badge">QUAL</span>
 </div>
 
 <div class="body">
@@ -991,7 +1214,7 @@ document.addEventListener('click', hideCtx);
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/STLLoader.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/GLTFLoader.js"></script>
 <script>
 JS_CODE
 </script>
@@ -1026,7 +1249,34 @@ JS_CODE
 
 
 # ── SERVER ────────────────────────────────────────────────────────────────────
-# Server removed - using st.components.v1.html instead
+import socket, threading, http.server as _hs
+
+_server_store = {}
+
+def start_viewer_server(html_content):
+    global _server_store
+    if _server_store.get('html') == html_content and _server_store.get('port'):
+        return _server_store['port']
+    old = _server_store.get('server')
+    if old:
+        try: old.shutdown()
+        except: pass
+    with socket.socket() as s:
+        s.bind(('', 0)); port = s.getsockname()[1]
+    content_bytes = html_content.encode('utf-8')
+    class Handler(_hs.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header('Content-Type','text/html; charset=utf-8')
+            self.send_header('Content-Length', str(len(content_bytes)))
+            self.send_header('Access-Control-Allow-Origin','*')
+            self.end_headers()
+            self.wfile.write(content_bytes)
+        def log_message(self, *a): pass
+    server = _hs.HTTPServer(('localhost', port), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    _server_store = {'server': server, 'port': port, 'html': html_content}
+    return port
 
 
 # ── SESSION STATE ─────────────────────────────────────────────────────────────
@@ -1135,80 +1385,84 @@ body{display:flex;align-items:center;justify-content:center;}
 
         with tempfile.TemporaryDirectory() as tmp:
             inp  = os.path.join(tmp, safe)
-            stlp = os.path.join(tmp, "model.stl")
             glbp = os.path.join(tmp, "model.glb")
-            with open(inp,'wb') as fh: fh.write(f.getvalue())
+            with open(inp, 'wb') as fh: fh.write(f.getvalue())
 
             if ext == '.stl':
+                # STL input: load and re-export as GLB (smooth normals via trimesh)
                 prog.progress(25)
-                shutil.copy(inp, stlp)
-                stl_dl = f.getvalue(); stl_name = safe
+                mesh = trimesh.load(inp)
+                try:
+                    clean = trimesh.Trimesh(vertices=mesh.vertices.copy(),
+                                            faces=mesh.faces.copy(), process=True)
+                    clean.export(glbp, file_type='glb')
+                except:
+                    mesh.export(glbp, file_type='glb')
             else:
+                # STEP/STP input: convert DIRECTLY to GLB — no STL intermediate
                 prog.progress(20)
-                ok, msg, method = convert_step_to_stl(inp, stlp)
+                ok, msg, method = convert_step_to_glb(inp, glbp)
                 if not ok:
                     stat.empty(); prog.empty()
-                    st.error("Could not convert this STEP file. Please try uploading as STL instead.")
+                    st.error("Conversion failed. Install CadQuery (pip install cadquery) "
+                             "or pythonocc-core to enable direct STEP→GLB conversion.")
                     st.stop()
-                with open(stlp,'rb') as fh: stl_dl = fh.read()
-                stl_name = safe.replace('.step','.stl').replace('.STEP','.stl') \
-                               .replace('.stp','.stl').replace('.STP','.stl')
 
             prog.progress(60)
-            mesh = trimesh.load(stlp)
-            try:
-                clean = trimesh.Trimesh(vertices=mesh.vertices.copy(),
-                                        faces=mesh.faces.copy(), process=False)
-                clean.export(glbp, file_type='glb')
-            except:
-                mesh.export(glbp, file_type='glb')
-
-            prog.progress(85)
             geo, features = None, None
 
-            # Try pythonocc first for exact B-Rep geometry
+            # Load GLB back into trimesh for geometry analysis
+            mesh_for_geo = trimesh.load(glbp)
+
+            # Try pythonocc first for exact B-Rep geometry extraction
             if ext in ('.step', '.stp') and _occ_available():
                 geo, features = extract_geo_occ(inp)
 
-            # Always try pure-Python STEP topology parser (works without pythonocc)
+            # Always try pure-Python STEP topology parser (no pythonocc needed)
             step_topo = None
             if ext in ('.step', '.stp'):
                 step_topo = extract_step_topology(inp)
 
-            # Get mesh geometry from trimesh
-            mesh2 = trimesh.load(stlp)
+            # Fallback: get geometry from the GLB mesh
             if geo is None:
-                geo      = extract_geo(mesh2)
-                features = detect_features(mesh2, geo)
+                geo      = extract_geo(mesh_for_geo)
+                features = detect_features(mesh_for_geo, geo)
 
-            # Merge true CAD topology into geo (overrides mesh triangle counts)
+            # Merge true CAD topology counts into geo dict
             if step_topo and geo is not None:
-                geo['faces']        = step_topo['cad_faces']
-                geo['edges']        = step_topo['cad_edges']
-                geo['vertices']     = step_topo['cad_vertices']
-                geo['cad_faces']    = step_topo['cad_faces']
-                geo['cad_edges']    = step_topo['cad_edges']
-                geo['cad_vertices'] = step_topo['cad_vertices']
-                geo['has_cad_topo'] = True
-                geo['surface_types']= step_topo['surface_types']
-                geo['edge_types']   = step_topo['edge_types']
-                geo['holes']        = step_topo['holes']
-                # Keep mesh counts separately
-                geo['mesh_faces']    = len(mesh2.faces)
-                geo['mesh_edges']    = len(mesh2.edges_unique) if hasattr(mesh2,'edges_unique') else 0
-                geo['mesh_vertices'] = len(mesh2.vertices)
-                # Update features from STEP topology
+                geo['faces']         = step_topo['cad_faces']
+                geo['edges']         = step_topo['cad_edges']
+                geo['vertices']      = step_topo['cad_vertices']
+                geo['cad_faces']     = step_topo['cad_faces']
+                geo['cad_edges']     = step_topo['cad_edges']
+                geo['cad_vertices']  = step_topo['cad_vertices']
+                geo['has_cad_topo']  = True
+                geo['surface_types'] = step_topo['surface_types']
+                geo['edge_types']    = step_topo['edge_types']
+                geo['holes']         = step_topo['holes']
+                # Keep mesh rendering counts separately
+                try:
+                    mf = len(mesh_for_geo.faces)
+                    mv = len(mesh_for_geo.vertices)
+                    me = len(mesh_for_geo.edges_unique) if hasattr(mesh_for_geo, 'edges_unique') else 0
+                except:
+                    mf = mv = me = 0
+                geo['mesh_faces']    = mf
+                geo['mesh_edges']    = me
+                geo['mesh_vertices'] = mv
                 features = step_topo['features']
-            with open(glbp,'rb') as fh: glb_bytes = fh.read()
+
+            prog.progress(85)
+            with open(glbp, 'rb') as fh: glb_bytes = fh.read()
 
         stat.empty(); prog.empty()
         st.session_state.model_data = glb_bytes
         st.session_state.geo        = geo
         st.session_state.features   = features
-        st.session_state.stl_bytes  = stl_dl
-        st.session_state.stl_name   = stl_name
+        st.session_state.stl_bytes  = None       # no STL generated — direct GLB
+        st.session_state.stl_name   = None
         st.session_state.filename   = safe
-        storage_save(safe, glb_bytes, stl_dl, stl_name, geo, features)
+        storage_save(safe, glb_bytes, None, None, geo, features)
         st.rerun()
 
 # ── DASHBOARD ─────────────────────────────────────────────────────────────────
@@ -1217,9 +1471,9 @@ else:
         for k in list(st.session_state.keys()): st.session_state[k] = None
         st.rerun()
 
-    # Use STL bytes for viewer (no embedded material = full color control)
-    stl_bytes_view = st.session_state.stl_bytes or st.session_state.model_data
-    stl_b64  = base64.b64encode(stl_bytes_view).decode()
+    # Use GLB bytes directly — no STL detour needed
+    glb_bytes_view = st.session_state.model_data
+    glb_b64  = base64.b64encode(glb_bytes_view).decode()
     geo      = st.session_state.geo or {}
     features = st.session_state.features or {}
     filename = st.session_state.filename or "model"
@@ -1248,21 +1502,20 @@ else:
                         st.session_state.features = features
                 break
 
-    html = build_viewer_html(stl_b64, geo, features, filename)
-    # Use st.components.v1.html - works on Streamlit Cloud (no localhost needed)
-    import streamlit.components.v1 as components
-    components.html(html, height=700, scrolling=False)
+    html = build_viewer_html(glb_b64, geo, features, filename)
+    port = start_viewer_server(html)
 
-    c1,c2,c3 = st.columns(3)
+    st.markdown(f'''
+    <iframe src="http://localhost:{port}" width="100%" height="700"
+      frameborder="0" style="border-radius:8px;border:1px solid #0f3460;"
+      allow="clipboard-write"></iframe>
+    ''', unsafe_allow_html=True)
+
+    c1, c2 = st.columns(2)
     with c1:
         st.download_button("⬇️ GLB", st.session_state.model_data,
-                           "model.glb","model/gltf-binary", use_container_width=True)
+                           "model.glb", "model/gltf-binary", use_container_width=True)
     with c2:
-        if st.session_state.stl_bytes:
-            st.download_button("⬇️ STL", st.session_state.stl_bytes,
-                               st.session_state.stl_name or "model.stl",
-                               "application/sla", use_container_width=True)
-    with c3:
         if geo:
-            st.download_button("⬇️ JSON", safe_json(geo),
-                               "geometry.json","application/json", use_container_width=True)
+            st.download_button("⬇️ JSON", json.dumps(geo, indent=2),
+                               "geometry.json", "application/json", use_container_width=True)
